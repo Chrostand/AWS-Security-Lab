@@ -1,0 +1,373 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Déploiement WordPress avec ALB, Auto Scaling, Launch Template, et RDS (AMI dynamique via SSM).",
+  "Parameters": {
+    "VpcId": {
+      "Type": "AWS::EC2::VPC::Id",
+      "Description": "ID de votre VPC existant"
+    },
+    "Subnets": {
+      "Type": "List<AWS::EC2::Subnet::Id>",
+      "Description": "Liste des subnets associés à au moins deux zones de disponibilité"
+    },
+    "KeyName": {
+      "Type": "AWS::EC2::KeyPair::KeyName",
+      "Description": "Nom de la paire de clés pour SSH"
+    },
+    "InstanceType": {
+      "Type": "String",
+      "Default": "t3.micro",
+      "AllowedValues": ["t2.micro", "t3.micro", "t2.small", "t2.medium"],
+      "Description": "Type d'instance EC2"
+    },
+    "DBClass": {
+      "Type": "String",
+      "Default": "db.t3.small",
+      "Description": "Classe de l'instance RDS"
+    },
+    "DBName": {
+      "Type": "String",
+      "Default": "wordpressdb",
+      "Description": "Nom de la base de données"
+    },
+    "DBUser": {
+      "NoEcho": "true",
+      "Type": "String",
+      "Description": "Utilisateur admin de la base de données"
+    },
+    "DBPassword": {
+      "NoEcho": "true",
+      "Type": "String",
+      "Description": "Mot de passe admin de la base de données"
+    },
+    "LatestAmiId": {
+      "Type": "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>",
+      "Default": "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2",
+      "Description": "Dernière AMI Amazon Linux 2 (via SSM)"
+    }
+  },
+  "Resources": {
+	"WordpressDBSecret": {
+      "Type": "AWS::SecretsManager::Secret",
+      "Properties": {
+        "Name": "wordpress-db-secret",
+        "Description": "Identifiants WordPress pour la base RDS",
+        "SecretString": {
+          "Fn::Sub": "{ \"username\": \"${DBUser}\", \"password\": \"${DBPassword}\" }"
+        }
+      }
+    },
+	"EC2Role": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": ["ec2.amazonaws.com"]
+              },
+              "Action": ["sts:AssumeRole"]
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "SecretAccessPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": ["secretsmanager:GetSecretValue"],
+                  "Resource": { "Ref": "WordpressDBSecret" }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+	"EC2InstanceProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "Roles": [
+          { "Ref": "EC2Role" }
+        ]
+      }
+    },
+    "ALBSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Autoriser HTTP vers le ALB",
+        "VpcId": { "Ref": "VpcId" },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 80,
+            "ToPort": 80,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ]
+      }
+    },
+    "WebServerSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Autoriser HTTP et SSH sur EC2",
+        "VpcId": { "Ref": "VpcId" },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 80,
+            "ToPort": 80,
+            "CidrIp": "0.0.0.0/0"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 22,
+            "ToPort": 22,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ]
+      }
+    },
+    "RDSSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Autoriser MySQL depuis les instances EC2",
+        "VpcId": { "Ref": "VpcId" },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 3306,
+            "ToPort": 3306,
+            "SourceSecurityGroupId": { "Ref": "WebServerSecurityGroup" }
+          }
+        ]
+      }
+    },
+    "ApplicationLoadBalancer": {
+      "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+      "Properties": {
+        "Subnets": { "Ref": "Subnets" },
+        "SecurityGroups": [{ "Ref": "ALBSecurityGroup" }],
+        "Scheme": "internet-facing"
+      }
+    },
+    "ALBTargetGroup": {
+      "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+      "Properties": {
+        "VpcId": { "Ref": "VpcId" },
+        "Protocol": "HTTP",
+        "Port": 80,
+        "TargetType": "instance",
+        "HealthCheckProtocol": "HTTP",
+        "HealthCheckPath": "/",
+        "HealthCheckPort": "80"
+      }
+    },
+    "ALBListener": {
+      "Type": "AWS::ElasticLoadBalancingV2::Listener",
+      "Properties": {
+        "LoadBalancerArn": { "Ref": "ApplicationLoadBalancer" },
+        "Port": 80,
+        "Protocol": "HTTP",
+        "DefaultActions": [
+          {
+            "Type": "forward",
+            "TargetGroupArn": { "Ref": "ALBTargetGroup" }
+          }
+        ]
+      }
+    },
+	"WebACL": {
+      "Type": "AWS::WAFv2::WebACL",
+      "Properties": {
+        "Name": "WordPressWebACL",
+        "Scope": "REGIONAL",
+        "DefaultAction": {
+          "Allow": {}
+        },
+        "VisibilityConfig": {
+          "CloudWatchMetricsEnabled": true,
+          "SampledRequestsEnabled": true,
+          "MetricName": "WordPressWebACL"
+        },
+        "Rules": [
+          {
+            "Name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+            "Priority": 0,
+            "Statement": {
+              "ManagedRuleGroupStatement": {
+                "VendorName": "AWS",
+                "Name": "AWSManagedRulesKnownBadInputsRuleSet"
+              }
+            },
+            "OverrideAction": {
+              "None": {}
+            },
+            "VisibilityConfig": {
+              "SampledRequestsEnabled": true,
+              "CloudWatchMetricsEnabled": true,
+              "MetricName": "KnownBadInputs"
+            }
+          },
+          {
+            "Name": "AWS-AWSManagedRulesSQLiRuleSet",
+            "Priority": 1,
+            "Statement": {
+              "ManagedRuleGroupStatement": {
+                "VendorName": "AWS",
+                "Name": "AWSManagedRulesSQLiRuleSet"
+              }
+            },
+            "OverrideAction": {
+              "None": {}
+            },
+            "VisibilityConfig": {
+              "SampledRequestsEnabled": true,
+              "CloudWatchMetricsEnabled": true,
+              "MetricName": "SQLInjection"
+            }
+          },
+          {
+            "Name": "AWS-AWSManagedRulesCommonRuleSet",
+            "Priority": 2,
+            "Statement": {
+              "ManagedRuleGroupStatement": {
+                "VendorName": "AWS",
+                "Name": "AWSManagedRulesCommonRuleSet"
+              }
+            },
+            "OverrideAction": {
+              "None": {}
+            },
+            "VisibilityConfig": {
+              "SampledRequestsEnabled": true,
+              "CloudWatchMetricsEnabled": true,
+              "MetricName": "CoreRules"
+            }
+          }
+        ]
+      }
+    },
+	 "WebACLAssociation": {
+      "Type": "AWS::WAFv2::WebACLAssociation",
+      "Properties": {
+        "ResourceArn": {
+          "Ref": "ApplicationLoadBalancer"
+        },
+        "WebACLArn": {
+          "Fn::GetAtt": ["WebACL", "Arn"]
+        }
+      }
+    },	
+    "WordPressLaunchTemplate": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Properties": {
+        "LaunchTemplateData": {
+          "ImageId": "ami-0c02fb55956c7d316",
+          "InstanceType": "t3.micro",
+          "IamInstanceProfile": {
+            "Arn": { "Fn::GetAtt": ["EC2InstanceProfile", "Arn"] }
+          },
+          "UserData": {
+            "Fn::Base64": {
+              "Fn::Join": [
+                "",
+                [
+                  "#!/bin/bash\n",
+                  "yum update -y\n",
+                  "yum install -y httpd php php-mysqlnd jq aws-cli\n",
+                  "systemctl start httpd\n",
+                  "systemctl enable httpd\n",
+                  "cd /var/www/html\n",
+                  "wget https://wordpress.org/latest.tar.gz\n",
+                  "tar -xzf latest.tar.gz\n",
+                  "cp -r wordpress/* .\n",
+                  "rm -rf wordpress latest.tar.gz\n",
+                  "cp wp-config-sample.php wp-config.php\n",
+                  "chmod -R 755 /var/www/html\n",
+                  "chown -R apache:apache /var/www/html\n",
+                  "SECRET=$(aws secretsmanager get-secret-value --secret-id wordpress-db-secret --region $(curl -s http://169.254.169.254/latest/meta-data/placement/region) | jq -r .SecretString)\n",
+                  "DBUSER=$(echo $SECRET | jq -r .username)\n",
+                  "DBPASS=$(echo $SECRET | jq -r .password)\n",
+                  "sed -i \"s/database_name_here/wordpress/\" wp-config.php\n",
+                  "sed -i \"s/username_here/$DBUSER/\" wp-config.php\n",
+                  "sed -i \"s/password_here/$DBPASS/\" wp-config.php\n",
+                  "sed -i \"s/localhost/wordpress-db.XXXXXXXXXX.rds.amazonaws.com/\" wp-config.php\n"
+                ]
+              ]
+            }
+          }
+        }
+      }
+    },
+    "WebServerGroup": {
+      "Type": "AWS::AutoScaling::AutoScalingGroup",
+      "Properties": {
+        "LaunchTemplate": {
+          "LaunchTemplateId": { "Ref": "LaunchTemplate" },
+          "Version": {
+            "Fn::GetAtt": ["LaunchTemplate", "LatestVersionNumber"]
+          }
+        },
+        "MinSize": "1",
+        "MaxSize": "3",
+        "DesiredCapacity": "2",
+        "VPCZoneIdentifier": { "Ref": "Subnets" },
+        "TargetGroupARNs": [{ "Ref": "ALBTargetGroup" }]
+      }
+    },
+    "DBSubnetGroup": {
+      "Type": "AWS::RDS::DBSubnetGroup",
+      "Properties": {
+        "DBSubnetGroupDescription": "Subnets pour RDS",
+        "SubnetIds": { "Ref": "Subnets" }
+      }
+    },
+    "DBInstance": {
+      "Type": "AWS::RDS::DBInstance",
+      "Properties": {
+        "DBName": { "Ref": "DBName" },
+        "Engine": "MySQL",
+        "MasterUsername": {
+          "Fn::Join": [
+            "",
+            [
+              "{{resolve:secretsmanager:",
+              { "Ref": "WordpressDBSecret" },
+              ":SecretString:username}}"
+            ]
+          ]
+        },
+        "MasterUserPassword": {
+          "Fn::Join": [
+            "",
+            [
+              "{{resolve:secretsmanager:",
+              { "Ref": "WordpressDBSecret" },
+              ":SecretString:password}}"
+            ]
+          ]
+        },
+        "DBInstanceClass": { "Ref": "DBClass" },
+        "AllocatedStorage": "20",
+        "VPCSecurityGroups": [{ "Ref": "RDSSecurityGroup" }],
+        "DBSubnetGroupName": { "Ref": "DBSubnetGroup" },
+        "PubliclyAccessible": false,
+        "MultiAZ": false
+      }
+    }
+  },
+  "Outputs": {
+    "WebsiteURL": {
+      "Description": "URL du site WordPress",
+      "Value": {
+        "Fn::GetAtt": ["ApplicationLoadBalancer", "DNSName"]
+      }
+    }
+  }
+}
